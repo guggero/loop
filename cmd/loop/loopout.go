@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"fmt"
+	"time"
 
 	"github.com/lightninglabs/loop"
 	"github.com/lightninglabs/loop/looprpc"
@@ -43,6 +44,13 @@ var loopOutCommand = cli.Command{
 				"initiation height that the on-chain HTLC " +
 				"should be swept within",
 			Value: uint64(loop.DefaultSweepConfTarget),
+		},
+		cli.Uint64Flag{
+			Name: "max_swap_wait_time",
+			Usage: "The maximum time (in seconds) we allow the " +
+				"server to wait before publishing the swap " +
+				"HTLC on-chain. Setting this to a larger " +
+				"value might result in a lower swap fee.",
 		},
 	},
 	Action: loopOut,
@@ -104,16 +112,22 @@ func loopOut(ctx *cli.Context) error {
 		unchargeChannel = ctx.Uint64("channel")
 	}
 
+	// Convert our maximum wait time to a absolute time deadline.
+	swapDeadline := time.Now().Add(
+		time.Duration(ctx.Uint64("max_swap_wait_time")) * time.Second,
+	)
+
 	resp, err := client.LoopOut(context.Background(), &looprpc.LoopOutRequest{
-		Amt:                 int64(amt),
-		Dest:                destAddr,
-		MaxMinerFee:         int64(limits.maxMinerFee),
-		MaxPrepayAmt:        int64(*limits.maxPrepayAmt),
-		MaxSwapFee:          int64(limits.maxSwapFee),
-		MaxPrepayRoutingFee: int64(*limits.maxPrepayRoutingFee),
-		MaxSwapRoutingFee:   int64(*limits.maxSwapRoutingFee),
-		LoopOutChannel:      unchargeChannel,
-		SweepConfTarget:     sweepConfTarget,
+		Amt:                     int64(amt),
+		Dest:                    destAddr,
+		MaxMinerFee:             int64(limits.maxMinerFee),
+		MaxPrepayAmt:            int64(*limits.maxPrepayAmt),
+		MaxSwapFee:              int64(limits.maxSwapFee),
+		MaxPrepayRoutingFee:     int64(*limits.maxPrepayRoutingFee),
+		MaxSwapRoutingFee:       int64(*limits.maxSwapRoutingFee),
+		LoopOutChannel:          unchargeChannel,
+		SweepConfTarget:         sweepConfTarget,
+		SwapPublicationDeadline: uint64(swapDeadline.Unix()),
 	})
 	if err != nil {
 		return err
