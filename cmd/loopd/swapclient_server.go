@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"sort"
+	"time"
 
 	"github.com/lightningnetwork/lnd/queue"
 
@@ -68,14 +69,15 @@ func (s *swapClientServer) LoopOut(ctx context.Context,
 	}
 
 	req := &loop.OutRequest{
-		Amount:              btcutil.Amount(in.Amt),
-		DestAddr:            sweepAddr,
-		MaxMinerFee:         btcutil.Amount(in.MaxMinerFee),
-		MaxPrepayAmount:     btcutil.Amount(in.MaxPrepayAmt),
-		MaxPrepayRoutingFee: btcutil.Amount(in.MaxPrepayRoutingFee),
-		MaxSwapRoutingFee:   btcutil.Amount(in.MaxSwapRoutingFee),
-		MaxSwapFee:          btcutil.Amount(in.MaxSwapFee),
-		SweepConfTarget:     sweepConfTarget,
+		Amount:                  btcutil.Amount(in.Amt),
+		DestAddr:                sweepAddr,
+		MaxMinerFee:             btcutil.Amount(in.MaxMinerFee),
+		MaxPrepayAmount:         btcutil.Amount(in.MaxPrepayAmt),
+		MaxPrepayRoutingFee:     btcutil.Amount(in.MaxPrepayRoutingFee),
+		MaxSwapRoutingFee:       btcutil.Amount(in.MaxSwapRoutingFee),
+		MaxSwapFee:              btcutil.Amount(in.MaxSwapFee),
+		SweepConfTarget:         sweepConfTarget,
+		SwapPublicationDeadline: time.Unix(int64(in.SwapPublicationDeadline), 0),
 	}
 	if in.LoopOutChannel != 0 {
 		req.LoopOutChannel = &in.LoopOutChannel
