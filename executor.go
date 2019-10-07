@@ -51,7 +51,7 @@ func (s *executor) run(mainCtx context.Context,
 	statusChan chan<- SwapInfo) error {
 
 	blockEpochChan, blockErrorChan, err :=
-		s.lnd.ChainNotifier.RegisterBlockEpochNtfn(mainCtx)
+		s.lnd.ChainNotifier.RegisterBlockEpochNtfn(mainCtx, nil)
 	if err != nil {
 		return err
 	}
@@ -69,7 +69,7 @@ func (s *executor) run(mainCtx context.Context,
 
 	select {
 	case h := <-blockEpochChan:
-		setHeight(h)
+		setHeight(h.Height)
 	case err := <-blockErrorChan:
 		return err
 	case <-mainCtx.Done():
@@ -134,10 +134,10 @@ func (s *executor) run(mainCtx context.Context,
 			delete(blockEpochQueues, doneID)
 
 		case h := <-blockEpochChan:
-			setHeight(h)
+			setHeight(h.Height)
 			for _, queue := range blockEpochQueues {
 				select {
-				case queue.ChanIn() <- h:
+				case queue.ChanIn() <- h.Height:
 				case <-mainCtx.Done():
 					return mainCtx.Err()
 				}

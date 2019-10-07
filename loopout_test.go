@@ -13,6 +13,7 @@ import (
 	"github.com/lightninglabs/loop/loopdb"
 	"github.com/lightninglabs/loop/sweep"
 	"github.com/lightninglabs/loop/test"
+	sweeper "github.com/lightningnetwork/lnd/sweep"
 )
 
 // TestLateHtlcPublish tests that the client is not revealing the preimage if
@@ -48,7 +49,17 @@ func TestLateHtlcPublish(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	sweeper := &sweep.Sweeper{Lnd: &lnd.LndServices}
+	sweeper := sweep.New(
+		&sweep.Config{
+			TxConfTarget: 6,
+			SweeperStore: sweeper.NewMockSweeperStore(),
+		}, &lnd.LndServices,
+	)
+
+	err = sweeper.Start()
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	blockEpochChan := make(chan interface{})
 	statusChan := make(chan SwapInfo)
@@ -136,7 +147,7 @@ func TestCustomSweepConfTarget(t *testing.T) {
 	// Set up the required dependencies to execute the swap.
 	//
 	// TODO: create test context similar to loopInTestContext.
-	sweeper := &sweep.Sweeper{Lnd: &lnd.LndServices}
+	sweeper := sweep.New(&sweep.Config{}, &lnd.LndServices)
 	blockEpochChan := make(chan interface{})
 	statusChan := make(chan SwapInfo)
 	expiryChan := make(chan time.Time)

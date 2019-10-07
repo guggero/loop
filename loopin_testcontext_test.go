@@ -7,6 +7,7 @@ import (
 	"github.com/lightninglabs/loop/loopdb"
 	"github.com/lightninglabs/loop/sweep"
 	"github.com/lightninglabs/loop/test"
+	sweeper "github.com/lightningnetwork/lnd/sweep"
 )
 
 type loopInTestContext struct {
@@ -24,7 +25,12 @@ func newLoopInTestContext(t *testing.T) *loopInTestContext {
 	lnd := test.NewMockLnd()
 	server := newServerMock()
 	store := newStoreMock(t)
-	sweeper := sweep.Sweeper{Lnd: &lnd.LndServices}
+	sweeper := sweep.New(
+		&sweep.Config{
+			TxConfTarget: 6,
+			SweeperStore: sweeper.NewMockSweeperStore(),
+		}, &lnd.LndServices,
+	)
 
 	blockEpochChan := make(chan interface{})
 	statusChan := make(chan SwapInfo)
@@ -36,7 +42,7 @@ func newLoopInTestContext(t *testing.T) *loopInTestContext {
 
 	cfg := executeConfig{
 		statusChan:     statusChan,
-		sweeper:        &sweeper,
+		sweeper:        sweeper,
 		blockEpochChan: blockEpochChan,
 		timerFactory:   timerFactory,
 	}
@@ -46,7 +52,7 @@ func newLoopInTestContext(t *testing.T) *loopInTestContext {
 		lnd:            lnd,
 		server:         server,
 		store:          store,
-		sweeper:        &sweeper,
+		sweeper:        sweeper,
 		cfg:            &cfg,
 		statusChan:     statusChan,
 		blockEpochChan: blockEpochChan,

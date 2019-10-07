@@ -3,6 +3,7 @@ package sweep
 import (
 	"context"
 	"fmt"
+	"time"
 
 	"github.com/btcsuite/btcd/btcec"
 	"github.com/btcsuite/btcd/txscript"
@@ -12,52 +13,98 @@ import (
 	"github.com/lightninglabs/loop/swap"
 	"github.com/lightningnetwork/lnd/input"
 	"github.com/lightningnetwork/lnd/keychain"
+	"github.com/lightningnetwork/lnd/lnwallet/chainfee"
+	"github.com/lightningnetwork/lnd/sweep"
 )
+
+// Config is the set of configuration options that must be given to the sweeper
+// to initialize it.
+type Config struct {
+	TxConfTarget        uint32
+	BatchWindowDuration time.Duration
+	SweeperStore        sweep.SweeperStore
+}
 
 // Sweeper creates htlc sweep txes.
 type Sweeper struct {
-	Lnd *lndclient.LndServices
+	cfg *Config
+	lnd *lndclient.LndServices
+
+	*sweep.UtxoSweeper
 }
 
-// CreateSweepTx creates an htlc sweep tx.
-func (s *Sweeper) CreateSweepTx(
-	globalCtx context.Context, height int32,
-	htlc *swap.Htlc, htlcOutpoint wire.OutPoint,
-	keyBytes [33]byte,
-	witnessFunc func(sig []byte) (wire.TxWitness, error),
-	amount, fee btcutil.Amount,
-	destAddr btcutil.Address) (*wire.MsgTx, error) {
+func New(cfg *Config, lnd *lndclient.LndServices) *Sweeper {
+	return &Sweeper{
+		cfg: cfg,
+		lnd: lnd,
+		UtxoSweeper: sweep.New(&sweep.UtxoSweeperConfig{
+			FeeEstimator: &feeEstimator{lnd},
+			GenSweepScript: func() ([]byte, error) {
+				return newSweepScript(lnd)
+			},
+			Signer: &signer{lnd},
+			PublishTransaction: func(tx *wire.MsgTx) error {
+				// TODO:context
+				ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+				defer cancel()
 
-	// Compose tx.
-	sweepTx := wire.NewMsgTx(2)
-
-	sweepTx.LockTime = uint32(height)
-
-	// Add HTLC input.
-	sweepTx.AddTxIn(&wire.TxIn{
-		PreviousOutPoint: htlcOutpoint,
-		SignatureScript:  htlc.SigScript,
-	})
-
-	// Add output for the destination address.
-	sweepPkScript, err := txscript.PayToAddrScript(destAddr)
-	if err != nil {
-		return nil, err
+				return lnd.WalletKit.PublishTransaction(ctx, tx)
+			},
+			NewBatchTimer: func() <-chan time.Time {
+				return time.NewTimer(cfg.BatchWindowDuration).C
+			},
+			Notifier:             &notifier{lnd},
+			Store:                cfg.SweeperStore,
+			MaxInputsPerTx:       sweep.DefaultMaxInputsPerTx,
+			MaxSweepAttempts:     sweep.DefaultMaxSweepAttempts,
+			NextAttemptDeltaFunc: sweep.DefaultNextAttemptDeltaFunc,
+			MaxFeeRate:           sweep.DefaultMaxFeeRate,
+			FeeRateBucketSize:    sweep.DefaultFeeRateBucketSize,
+		}),
 	}
+}
 
-	sweepTx.AddTxOut(&wire.TxOut{
-		PkScript: sweepPkScript,
-		Value:    int64(amount - fee),
-	})
+func (s *Sweeper) CreateSweepTx(globalCtx context.Context, height uint32,
+	htlc *swap.Htlc, htlcOutpoint wire.OutPoint, keyBytes [33]byte,
+	amount btcutil.Amount, witnessType input.WitnessType) (
+	*wire.MsgTx, error) {
 
-	// Generate a signature for the swap htlc transaction.
+	feePref := sweep.FeePreference{ConfTarget: s.cfg.TxConfTarget}
+	return s.createSweepTx(
+		globalCtx, height, htlc, htlcOutpoint, keyBytes, amount,
+		witnessType, feePref,
+	)
+}
+
+func (s *Sweeper) CreateSweepTxCustomFee(globalCtx context.Context,
+	height uint32, htlc *swap.Htlc, htlcOutpoint wire.OutPoint,
+	keyBytes [33]byte, amount btcutil.Amount, witnessType input.WitnessType,
+	feeRate chainfee.SatPerKWeight) (*wire.MsgTx, error) {
+
+	feePref := sweep.FeePreference{FeeRate: feeRate}
+	return s.createSweepTx(
+		globalCtx, height, htlc, htlcOutpoint, keyBytes, amount,
+		witnessType, feePref,
+	)
+}
+
+func (s *Sweeper) createSweepTx(globalCtx context.Context,
+	height uint32, htlc *swap.Htlc, htlcOutpoint wire.OutPoint,
+	keyBytes [33]byte, amount btcutil.Amount, witnessType input.WitnessType,
+	feePref sweep.FeePreference) (*wire.MsgTx, error) {
+
+	log.Infof("Publishing timeout tx")
 
 	key, err := btcec.ParsePubKey(keyBytes[:], btcec.S256())
 	if err != nil {
 		return nil, err
 	}
 
-	signDesc := input.SignDescriptor{
+	var weightEstimate input.TxWeightEstimator
+	weightEstimate.AddP2WKHOutput()
+	htlc.AddTimeoutToEstimator(&weightEstimate)
+
+	signDesc := &input.SignDescriptor{
 		WitnessScript: htlc.Script,
 		Output: &wire.TxOut{
 			Value: int64(amount),
@@ -68,22 +115,35 @@ func (s *Sweeper) CreateSweepTx(
 			PubKey: key,
 		},
 	}
-
-	rawSigs, err := s.Lnd.Signer.SignOutputRaw(
-		globalCtx, sweepTx, []*input.SignDescriptor{&signDesc},
+	
+	inp := input.MakeBaseInput(
+		&htlcOutpoint, witnessType, signDesc, height,
 	)
-	if err != nil {
-		return nil, fmt.Errorf("signing: %v", err)
-	}
-	sig := rawSigs[0]
 
-	// Add witness stack to the tx input.
-	sweepTx.TxIn[0].Witness, err = witnessFunc(sig)
+	// With our input constructed, we'll now offer it to the
+	// sweeper.
+	log.Infof("sweeping input")
+	resultChan, err := s.SweepInput(&inp, feePref)
 	if err != nil {
 		return nil, err
 	}
 
-	return sweepTx, nil
+	log.Infof("waiting for result")
+	// Sweeper is going to join this input with other inputs if
+	// possible and publish the sweep tx. When the sweep tx
+	// confirms, it signals us through the result channel with the
+	// outcome. Wait for this to happen.
+	select {
+	case sweepResult := <-resultChan:
+		if sweepResult.Err != nil {
+			return nil, sweepResult.Err
+		}
+
+		log.Infof("Sweep success")
+		return sweepResult.Tx, nil
+	case <-globalCtx.Done():
+		return nil, fmt.Errorf("quitting")
+	}
 }
 
 // GetSweepFee calculates the required tx fee to spend to P2WKH. It takes a
@@ -92,12 +152,12 @@ func (s *Sweeper) CreateSweepTx(
 func (s *Sweeper) GetSweepFee(ctx context.Context,
 	addInputEstimate func(*input.TxWeightEstimator),
 	destAddr btcutil.Address, sweepConfTarget int32) (
-	btcutil.Amount, error) {
+	btcutil.Amount, int64, error) {
 
 	// Get fee estimate from lnd.
-	feeRate, err := s.Lnd.WalletKit.EstimateFee(ctx, sweepConfTarget)
+	feeRate, err := s.lnd.WalletKit.EstimateFee(ctx, sweepConfTarget)
 	if err != nil {
-		return 0, fmt.Errorf("estimate fee: %v", err)
+		return 0, 0, fmt.Errorf("estimate fee: %v", err)
 	}
 
 	// Calculate weight for this tx.
@@ -112,11 +172,11 @@ func (s *Sweeper) GetSweepFee(ctx context.Context,
 	case *btcutil.AddressPubKeyHash:
 		weightEstimate.AddP2PKHOutput()
 	default:
-		return 0, fmt.Errorf("unknown address type %T", destAddr)
+		return 0, 0, fmt.Errorf("unknown address type %T", destAddr)
 	}
 
 	addInputEstimate(&weightEstimate)
-	weight := weightEstimate.Weight()
+	weight := int64(weightEstimate.Weight())
 
-	return feeRate.FeeForWeight(int64(weight)), nil
+	return feeRate.FeeForWeight(weight), weight, nil
 }

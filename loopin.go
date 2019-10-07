@@ -7,17 +7,14 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/btcsuite/btcutil"
-
-	"github.com/lightningnetwork/lnd/chainntnfs"
-	"github.com/lightningnetwork/lnd/channeldb"
-
 	"github.com/btcsuite/btcd/wire"
-	"github.com/lightningnetwork/lnd/lnrpc/invoicesrpc"
-
+	"github.com/btcsuite/btcutil"
 	"github.com/lightninglabs/loop/lndclient"
 	"github.com/lightninglabs/loop/loopdb"
 	"github.com/lightninglabs/loop/swap"
+	"github.com/lightningnetwork/lnd/chainntnfs"
+	"github.com/lightningnetwork/lnd/channeldb"
+	"github.com/lightningnetwork/lnd/lnrpc/invoicesrpc"
 	"github.com/lightningnetwork/lnd/lntypes"
 )
 
@@ -48,8 +45,6 @@ type loopInSwap struct {
 	swapKit
 
 	loopdb.LoopInContract
-
-	timeoutAddr btcutil.Address
 }
 
 // newLoopInSwap initiates a new loop in swap.
@@ -573,44 +568,17 @@ func (s *loopInSwap) processHtlcSpend(ctx context.Context,
 func (s *loopInSwap) publishTimeoutTx(ctx context.Context,
 	htlc *wire.OutPoint) error {
 
-	if s.timeoutAddr == nil {
-		var err error
-		s.timeoutAddr, err = s.lnd.WalletKit.NextAddr(ctx)
-		if err != nil {
-			return err
-		}
-	}
-
-	// Calculate sweep tx fee
-	fee, err := s.sweeper.GetSweepFee(
-		ctx, s.htlc.AddTimeoutToEstimator, s.timeoutAddr,
-		TimeoutTxConfTarget,
-	)
-	if err != nil {
-		return err
-	}
-
-	witnessFunc := func(sig []byte) (wire.TxWitness, error) {
-		return s.htlc.GenTimeoutWitness(sig)
-	}
-
+	s.log.Infof("Publishing timeout tx")
+	witnessType := swap.NewTimeoutSweepWitness(s.htlc, uint32(s.height))
 	timeoutTx, err := s.sweeper.CreateSweepTx(
-		ctx, s.height, s.htlc, *htlc, s.SenderKey, witnessFunc,
-		s.LoopInContract.AmountRequested, fee, s.timeoutAddr,
+		ctx, uint32(s.height), s.htlc, *htlc, s.SenderKey,
+		s.LoopInContract.AmountRequested, witnessType,
 	)
 	if err != nil {
 		return err
 	}
 
-	timeoutTxHash := timeoutTx.TxHash()
-	s.log.Infof("Publishing timeout tx %v with fee %v to addr %v",
-		timeoutTxHash, fee, s.timeoutAddr)
-
-	err = s.lnd.WalletKit.PublishTransaction(ctx, timeoutTx)
-	if err != nil {
-		s.log.Warnf("publish timeout: %v", err)
-	}
-
+	s.log.Infof("Published timeout tx %v", timeoutTx.TxHash())
 	return nil
 }
 

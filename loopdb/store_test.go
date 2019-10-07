@@ -44,8 +44,9 @@ func TestLoopOutStore(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer os.RemoveAll(tempDirName)
-
-	store, err := NewBoltSwapStore(tempDirName, &chaincfg.MainNetParams)
+	
+	db := openDb(t, tempDirName)
+	store, err := NewBoltSwapStore(db, &chaincfg.MainNetParams)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -162,7 +163,10 @@ func TestLoopOutStore(t *testing.T) {
 
 	// If we re-open the same store, then the state of the current swap
 	// should be the same.
-	store, err = NewBoltSwapStore(tempDirName, &chaincfg.MainNetParams)
+	db2 := openDb(t, tempDirName)
+	defer db2.Close()
+	
+	store, err = NewBoltSwapStore(db2, &chaincfg.MainNetParams)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -177,8 +181,9 @@ func TestLoopInStore(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer os.RemoveAll(tempDirName)
-
-	store, err := NewBoltSwapStore(tempDirName, &chaincfg.MainNetParams)
+	
+	db := openDb(t, tempDirName)
+	store, err := NewBoltSwapStore(db, &chaincfg.MainNetParams)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -290,7 +295,10 @@ func TestLoopInStore(t *testing.T) {
 
 	// If we re-open the same store, then the state of the current swap
 	// should be the same.
-	store, err = NewBoltSwapStore(tempDirName, &chaincfg.MainNetParams)
+	db2 := openDb(t, tempDirName)
+	defer db2.Close()
+	
+	store, err = NewBoltSwapStore(db2, &chaincfg.MainNetParams)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -306,7 +314,10 @@ func TestVersionNew(t *testing.T) {
 	}
 	defer os.RemoveAll(tempDirName)
 
-	store, err := NewBoltSwapStore(tempDirName, &chaincfg.MainNetParams)
+	db := openDb(t, tempDirName)
+	defer db.Close()
+	
+	store, err := NewBoltSwapStore(db, &chaincfg.MainNetParams)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -331,8 +342,10 @@ func TestVersionMigrated(t *testing.T) {
 	defer os.RemoveAll(tempDirName)
 
 	createVersionZeroDb(t, tempDirName)
+	db := openDb(t, tempDirName)
+	defer db.Close()
 
-	store, err := NewBoltSwapStore(tempDirName, &chaincfg.MainNetParams)
+	store, err := NewBoltSwapStore(db, &chaincfg.MainNetParams)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -350,7 +363,7 @@ func TestVersionMigrated(t *testing.T) {
 // createVersionZeroDb creates a database with an empty meta bucket. In version
 // zero, there was no version key specified yet.
 func createVersionZeroDb(t *testing.T, dbPath string) {
-	path := filepath.Join(dbPath, dbFileName)
+	path := filepath.Join(dbPath, DBFileName)
 	bdb, err := bbolt.Open(path, 0600, nil)
 	if err != nil {
 		t.Fatal(err)
@@ -364,4 +377,13 @@ func createVersionZeroDb(t *testing.T, dbPath string) {
 	if err != nil {
 		t.Fatal(err)
 	}
+}
+
+func openDb(t *testing.T, dbPath string) *bbolt.DB {
+	path := filepath.Join(dbPath, DBFileName)
+	bdb, err := bbolt.Open(path, 0600, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return bdb
 }

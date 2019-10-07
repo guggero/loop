@@ -15,8 +15,9 @@ import (
 
 // ChainNotifierClient exposes base lightning functionality.
 type ChainNotifierClient interface {
-	RegisterBlockEpochNtfn(ctx context.Context) (
-		chan int32, chan error, error)
+	RegisterBlockEpochNtfn(ctx context.Context,
+		bestBlock *chainntnfs.BlockEpoch) (chan *chainntnfs.BlockEpoch,
+		chan error, error)
 
 	RegisterConfirmationsNtfn(ctx context.Context, txid *chainhash.Hash,
 		pkScript []byte, numConfs, heightHint int32) (
@@ -34,7 +35,11 @@ type chainNotifierClient struct {
 	wg sync.WaitGroup
 }
 
-func newChainNotifierClient(conn *grpc.ClientConn, chainMac serializedMacaroon) *chainNotifierClient {
+var _ ChainNotifierClient = (*chainNotifierClient)(nil)
+
+func newChainNotifierClient(conn *grpc.ClientConn,
+	chainMac serializedMacaroon) *chainNotifierClient {
+
 	return &chainNotifierClient{
 		client:   chainrpc.NewChainNotifierClient(conn),
 		chainMac: chainMac,
@@ -58,11 +63,13 @@ func (s *chainNotifierClient) RegisterSpendNtfn(ctx context.Context,
 	}
 
 	macaroonAuth := s.chainMac.WithMacaroonAuth(ctx)
-	resp, err := s.client.RegisterSpendNtfn(macaroonAuth, &chainrpc.SpendRequest{
-		HeightHint: uint32(heightHint),
-		Outpoint:   rpcOutpoint,
-		Script:     pkScript,
-	})
+	resp, err := s.client.RegisterSpendNtfn(
+		macaroonAuth, &chainrpc.SpendRequest{
+			HeightHint: uint32(heightHint),
+			Outpoint:   rpcOutpoint,
+			Script:     pkScript,
+		},
+	)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -203,18 +210,26 @@ func (s *chainNotifierClient) RegisterConfirmationsNtfn(ctx context.Context,
 	return confChan, errChan, nil
 }
 
-func (s *chainNotifierClient) RegisterBlockEpochNtfn(ctx context.Context) (
-	chan int32, chan error, error) {
+func (s *chainNotifierClient) RegisterBlockEpochNtfn(ctx context.Context,
+	bestBlock *chainntnfs.BlockEpoch) (chan *chainntnfs.BlockEpoch,
+	chan error, error) {
+
+	req := &chainrpc.BlockEpoch{}
+
+	if bestBlock != nil {
+		req.Hash = bestBlock.Hash[:]
+		req.Height = uint32(bestBlock.Height)
+	}
 
 	blockEpochClient, err := s.client.RegisterBlockEpochNtfn(
-		s.chainMac.WithMacaroonAuth(ctx), &chainrpc.BlockEpoch{},
+		s.chainMac.WithMacaroonAuth(ctx), req,
 	)
 	if err != nil {
 		return nil, nil, err
 	}
 
 	blockErrorChan := make(chan error, 1)
-	blockEpochChan := make(chan int32)
+	blockEpochChan := make(chan *chainntnfs.BlockEpoch)
 
 	// Start block epoch goroutine.
 	s.wg.Add(1)
@@ -227,8 +242,18 @@ func (s *chainNotifierClient) RegisterBlockEpochNtfn(ctx context.Context) (
 				return
 			}
 
+			hash, err := chainhash.NewHash(epoch.Hash)
+			if err != nil {
+				blockErrorChan <- err
+				return
+			}
+			blockEpoch := &chainntnfs.BlockEpoch{
+				Hash:   hash,
+				Height: int32(epoch.Height),
+			}
+			
 			select {
-			case blockEpochChan <- int32(epoch.Height):
+			case blockEpochChan <- blockEpoch:
 			case <-ctx.Done():
 				return
 			}

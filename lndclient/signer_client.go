@@ -14,12 +14,18 @@ import (
 type SignerClient interface {
 	SignOutputRaw(ctx context.Context, tx *wire.MsgTx,
 		signDescriptors []*input.SignDescriptor) ([][]byte, error)
+
+	ComputeInputScript(ctx context.Context, tx *wire.MsgTx,
+		signDescriptors []*input.SignDescriptor) (
+		[]*input.Script, error)
 }
 
 type signerClient struct {
 	client    signrpc.SignerClient
 	signerMac serializedMacaroon
 }
+
+var _ SignerClient = (*signerClient)(nil)
 
 func newSignerClient(conn *grpc.ClientConn,
 	signerMac serializedMacaroon) *signerClient {
@@ -30,15 +36,12 @@ func newSignerClient(conn *grpc.ClientConn,
 	}
 }
 
-func (s *signerClient) SignOutputRaw(ctx context.Context, tx *wire.MsgTx,
-	signDescriptors []*input.SignDescriptor) ([][]byte, error) {
+func convertDescriptors(
+	signDescriptors []*input.SignDescriptor) []*signrpc.SignDescriptor {
 
-	txRaw, err := swap.EncodeTx(tx)
-	if err != nil {
-		return nil, err
-	}
-
-	rpcSignDescs := make([]*signrpc.SignDescriptor, len(signDescriptors))
+	rpcSignDescriptors := make(
+		[]*signrpc.SignDescriptor, len(signDescriptors),
+	)
 	for i, signDesc := range signDescriptors {
 		var keyBytes []byte
 		var keyLocator *signrpc.KeyLocator
@@ -60,7 +63,7 @@ func (s *signerClient) SignOutputRaw(ctx context.Context, tx *wire.MsgTx,
 			doubleTweak = signDesc.DoubleTweak.Serialize()
 		}
 
-		rpcSignDescs[i] = &signrpc.SignDescriptor{
+		rpcSignDescriptors[i] = &signrpc.SignDescriptor{
 			WitnessScript: signDesc.WitnessScript,
 			Output: &signrpc.TxOut{
 				PkScript: signDesc.Output.PkScript,
@@ -76,6 +79,18 @@ func (s *signerClient) SignOutputRaw(ctx context.Context, tx *wire.MsgTx,
 			DoubleTweak: doubleTweak,
 		}
 	}
+	return rpcSignDescriptors
+}
+
+func (s *signerClient) SignOutputRaw(ctx context.Context, tx *wire.MsgTx,
+	signDescriptors []*input.SignDescriptor) ([][]byte, error) {
+
+	txRaw, err := swap.EncodeTx(tx)
+	if err != nil {
+		return nil, err
+	}
+
+	rpcSignDescriptors := convertDescriptors(signDescriptors)
 
 	rpcCtx, cancel := context.WithTimeout(ctx, rpcTimeout)
 	defer cancel()
@@ -84,7 +99,7 @@ func (s *signerClient) SignOutputRaw(ctx context.Context, tx *wire.MsgTx,
 	resp, err := s.client.SignOutputRaw(rpcCtx,
 		&signrpc.SignReq{
 			RawTxBytes: txRaw,
-			SignDescs:  rpcSignDescs,
+			SignDescs:  rpcSignDescriptors,
 		},
 	)
 	if err != nil {
@@ -92,4 +107,39 @@ func (s *signerClient) SignOutputRaw(ctx context.Context, tx *wire.MsgTx,
 	}
 
 	return resp.RawSigs, nil
+}
+
+func (s *signerClient) ComputeInputScript(ctx context.Context, tx *wire.MsgTx,
+	signDescriptors []*input.SignDescriptor) ([]*input.Script, error) {
+
+	txRaw, err := swap.EncodeTx(tx)
+	if err != nil {
+		return nil, err
+	}
+
+	rpcSignDescriptors := convertDescriptors(signDescriptors)
+
+	rpcCtx, cancel := context.WithTimeout(ctx, rpcTimeout)
+	defer cancel()
+
+	rpcCtx = s.signerMac.WithMacaroonAuth(rpcCtx)
+	resp, err := s.client.ComputeInputScript(rpcCtx,
+		&signrpc.SignReq{
+			RawTxBytes: txRaw,
+			SignDescs:  rpcSignDescriptors,
+		},
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	scripts := make([]*input.Script, len(resp.InputScripts))
+	for i, script := range resp.InputScripts {
+		scripts[i] = &input.Script{
+			Witness:   script.Witness,
+			SigScript: script.SigScript,
+		}
+	}
+
+	return scripts, nil
 }

@@ -13,6 +13,7 @@ import (
 	"github.com/lightninglabs/loop/test"
 	"github.com/lightningnetwork/lnd/chainntnfs"
 	"github.com/lightningnetwork/lnd/lntypes"
+	sweeper "github.com/lightningnetwork/lnd/sweep"
 )
 
 var (
@@ -37,9 +38,18 @@ type testContext struct {
 	stop       func()
 }
 
-func newSwapClient(config *clientConfig) *Client {
-	sweeper := &sweep.Sweeper{
-		Lnd: config.LndServices,
+func newSwapClient(t *testing.T, config *clientConfig) *Client {
+
+	sweeper := sweep.New(
+		&sweep.Config{
+			TxConfTarget: 6,
+			SweeperStore: sweeper.NewMockSweeperStore(),
+		}, config.LndServices,
+	)
+	
+	err := sweeper.Start()
+	if err != nil {
+		
 	}
 
 	lndServices := config.LndServices
@@ -84,7 +94,7 @@ func createClientTestContext(t *testing.T,
 		return expiryChan
 	}
 
-	swapClient := newSwapClient(&clientConfig{
+	swapClient := newSwapClient(t, &clientConfig{
 		LndServices:       &clientLnd.LndServices,
 		Server:            serverMock,
 		Store:             store,
@@ -117,6 +127,11 @@ func createClientTestContext(t *testing.T,
 		log.Errorf("client run: %v", err)
 		ctx.runErr <- err
 	}()
+
+	err := swapClient.sweeper.Start()
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	return ctx
 }

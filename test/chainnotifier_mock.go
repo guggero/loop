@@ -1,19 +1,25 @@
 package test
 
 import (
+	"fmt"
 	"sync"
 	"time"
 
 	"github.com/btcsuite/btcd/chaincfg/chainhash"
 	"github.com/btcsuite/btcd/wire"
+	"github.com/lightninglabs/loop/lndclient"
 	"github.com/lightningnetwork/lnd/chainntnfs"
 	"golang.org/x/net/context"
 )
 
 type mockChainNotifier struct {
-	lnd *LndMockServices
-	wg  sync.WaitGroup
+	lnd         *LndMockServices
+	wg          sync.WaitGroup
+	blockHash   *chainhash.Hash
+	blockHeight int32
 }
+
+var _ lndclient.ChainNotifierClient = (*mockChainNotifier)(nil)
 
 // SpendRegistration contains registration details.
 type SpendRegistration struct {
@@ -34,11 +40,13 @@ func (c *mockChainNotifier) RegisterSpendNtfn(ctx context.Context,
 	outpoint *wire.OutPoint, pkScript []byte, heightHint int32) (
 	chan *chainntnfs.SpendDetail, chan error, error) {
 
+	fmt.Println("register spend chan")
 	c.lnd.RegisterSpendChannel <- &SpendRegistration{
 		HeightHint: heightHint,
 		Outpoint:   outpoint,
 		PkScript:   pkScript,
 	}
+	fmt.Println("sent on register spend chan")
 
 	spendChan := make(chan *chainntnfs.SpendDetail, 1)
 	errChan := make(chan error, 1)
@@ -64,19 +72,22 @@ func (c *mockChainNotifier) WaitForFinished() {
 	c.wg.Wait()
 }
 
-func (c *mockChainNotifier) RegisterBlockEpochNtfn(ctx context.Context) (
-	chan int32, chan error, error) {
+func (c *mockChainNotifier) RegisterBlockEpochNtfn(ctx context.Context,
+	bestBlock *chainntnfs.BlockEpoch) (chan *chainntnfs.BlockEpoch,
+	chan error, error) {
 
 	blockErrorChan := make(chan error, 1)
-	blockEpochChan := make(chan int32)
+	blockEpochChan := make(chan *chainntnfs.BlockEpoch)
 
 	c.wg.Add(1)
 	go func() {
 		defer c.wg.Done()
 
+		initialEpoch := &chainntnfs.BlockEpoch{Height: c.lnd.Height}
+
 		// Send initial block height
 		select {
-		case blockEpochChan <- c.lnd.Height:
+		case blockEpochChan <- initialEpoch:
 		case <-ctx.Done():
 			return
 		}
@@ -84,8 +95,12 @@ func (c *mockChainNotifier) RegisterBlockEpochNtfn(ctx context.Context) (
 		for {
 			select {
 			case m := <-c.lnd.epochChannel:
+
+				epoch := &chainntnfs.BlockEpoch{
+					Height: m,
+				}
 				select {
-				case blockEpochChan <- m:
+				case blockEpochChan <- epoch:
 				case <-ctx.Done():
 					return
 				}

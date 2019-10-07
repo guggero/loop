@@ -15,6 +15,7 @@ import (
 	"github.com/lightninglabs/loop/sweep"
 	"github.com/lightningnetwork/lnd/chainntnfs"
 	"github.com/lightningnetwork/lnd/lntypes"
+	"github.com/lightningnetwork/lnd/lnwallet/chainfee"
 )
 
 var (
@@ -590,15 +591,8 @@ func (s *loopOutSwap) waitForHtlcSpendConfirmed(globalCtx context.Context,
 // sweep tries to sweep the given htlc to a destination address. It takes into
 // account the max miner fee and marks the preimage as revealed when it
 // published the tx.
-//
-// TODO: Use lnd sweeper?
-func (s *loopOutSwap) sweep(ctx context.Context,
-	htlcOutpoint wire.OutPoint,
+func (s *loopOutSwap) sweep(ctx context.Context, htlcOutpoint wire.OutPoint,
 	htlcValue btcutil.Amount) error {
-
-	witnessFunc := func(sig []byte) (wire.TxWitness, error) {
-		return s.htlc.GenSuccessWitness(sig, s.Preimage)
-	}
 
 	// Calculate the transaction fee based on the confirmation target
 	// required to sweep the HTLC before the timeout. We'll use the
@@ -610,7 +604,7 @@ func (s *loopOutSwap) sweep(ctx context.Context,
 		confTarget > DefaultSweepConfTarget {
 		confTarget = DefaultSweepConfTarget
 	}
-	fee, err := s.sweeper.GetSweepFee(
+	fee, weight, err := s.sweeper.GetSweepFee(
 		ctx, s.htlc.AddSuccessToEstimator, s.DestAddr, confTarget,
 	)
 	if err != nil {
@@ -633,15 +627,6 @@ func (s *loopOutSwap) sweep(ctx context.Context,
 		}
 	}
 
-	// Create sweep tx.
-	sweepTx, err := s.sweeper.CreateSweepTx(
-		ctx, s.height, s.htlc, htlcOutpoint, s.ReceiverKey, witnessFunc,
-		htlcValue, fee, s.DestAddr,
-	)
-	if err != nil {
-		return err
-	}
-
 	// Before publishing the tx, already mark the preimage as revealed. This
 	// is a precaution in case the publish call never returns and would
 	// leave us thinking we didn't reveal yet.
@@ -654,15 +639,25 @@ func (s *loopOutSwap) sweep(ctx context.Context,
 		}
 	}
 
-	// Publish tx.
-	s.log.Infof("Sweep on chain HTLC to address %v with fee %v (tx %v)",
-		s.DestAddr, fee, sweepTx.TxHash())
+	// Since we committed to an absolute fee and not a fee rate, we have to
+	// convert the fee back to a fee rate for the sweeper.
+	feeRate := chainfee.SatPerKWeight(
+		btcutil.Amount((int64(fee) * weight) / 1000),
+	)
 
-	err = s.lnd.WalletKit.PublishTransaction(ctx, sweepTx)
+	// Give TX to sweeper and wait for it.
+	witnessType := swap.NewSuccessSweepWitness(
+		s.htlc, uint32(s.height), s.Preimage,
+	)
+	sweepTx, err := s.sweeper.CreateSweepTxCustomFee(
+		ctx, uint32(s.height), s.htlc, htlcOutpoint, s.ReceiverKey,
+		htlcValue, witnessType, feeRate,
+	)
 	if err != nil {
-		s.log.Warnf("Publish sweep: %v", err)
+		return err
 	}
 
+	s.log.Infof("Published sweep TX %v", sweepTx.TxHash())
 	return nil
 }
 

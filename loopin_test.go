@@ -4,15 +4,17 @@ import (
 	"context"
 	"testing"
 
+	"github.com/btcsuite/btcd/wire"
+	"github.com/btcsuite/btclog"
+	"github.com/btcsuite/btcutil"
 	"github.com/lightninglabs/loop/lndclient"
 	"github.com/lightninglabs/loop/loopdb"
 	"github.com/lightninglabs/loop/swap"
 	"github.com/lightninglabs/loop/test"
+	"github.com/lightningnetwork/lnd/build"
 	"github.com/lightningnetwork/lnd/chainntnfs"
 	"github.com/lightningnetwork/lnd/channeldb"
-
-	"github.com/btcsuite/btcd/wire"
-	"github.com/btcsuite/btcutil"
+	"github.com/lightningnetwork/lnd/sweep"
 )
 
 var (
@@ -29,6 +31,10 @@ func TestLoopInSuccess(t *testing.T) {
 	defer test.Guard(t)()
 
 	ctx := newLoopInTestContext(t)
+	err := ctx.sweeper.Start()
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	height := int32(600)
 
@@ -116,9 +122,17 @@ func TestLoopInSuccess(t *testing.T) {
 // TestLoopInTimeout tests the scenario where the server doesn't sweep the htlc
 // and the client is forced to reclaim the funds using the timeout tx.
 func TestLoopInTimeout(t *testing.T) {
-	defer test.Guard(t)()
+	// defer test.Guard(t)()
+	backend := btclog.NewBackend(&build.LogWriter{})
+	logger := backend.Logger("LOOPINTEST")
+	logger.SetLevel(btclog.LevelTrace)
+	sweep.UseLogger(logger)
 
 	ctx := newLoopInTestContext(t)
+	err := ctx.sweeper.Start()
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	height := int32(600)
 
@@ -175,8 +189,13 @@ func TestLoopInTimeout(t *testing.T) {
 	// Let htlc expire.
 	ctx.blockEpochChan <- swap.LoopInContract.CltvExpiry
 
+	// Client starts listening for spend of timeout tx.
+	<-ctx.lnd.RegisterSpendChannel
+
 	// Expect timeout tx to be published.
 	timeoutTx := <-ctx.lnd.TxPublishChannel
+
+	ctx.blockEpochChan <- 1
 
 	// Confirm timeout tx.
 	ctx.lnd.SpendChannel <- &chainntnfs.SpendDetail{
@@ -221,6 +240,10 @@ func testLoopInResume(t *testing.T, state loopdb.SwapState, expired bool) {
 	defer test.Guard(t)()
 
 	ctx := newLoopInTestContext(t)
+	err := ctx.sweeper.Start()
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	cfg := &swapConfig{
 		lnd:    &ctx.lnd.LndServices,

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"crypto/sha256"
 	"errors"
+	"fmt"
 
 	"github.com/btcsuite/btcd/chaincfg"
 	"github.com/btcsuite/btcd/txscript"
@@ -16,6 +17,8 @@ import (
 // HtlcOutputType defines the output type of the htlc that is published.
 type HtlcOutputType uint8
 
+type HtlcSweepType uint8
+
 const (
 	// HtlcP2WSH is a pay-to-witness-script-hash output (segwit only)
 	HtlcP2WSH HtlcOutputType = iota
@@ -23,6 +26,10 @@ const (
 	// HtlcNP2WSH is a nested pay-to-witness-script-hash output that can be
 	// paid to be legacy wallets.
 	HtlcNP2WSH
+
+	HtlcSuccess HtlcSweepType = 0
+
+	HtlcTimeout HtlcSweepType = 1
 )
 
 // Htlc contains relevant htlc information from the receiver perspective.
@@ -217,8 +224,7 @@ func (h *Htlc) GenTimeoutWitness(senderSig []byte) (wire.TxWitness, error) {
 	return witnessStack, nil
 }
 
-// AddSuccessToEstimator adds a successful spend to a weight estimator.
-func (h *Htlc) AddSuccessToEstimator(estimator *input.TxWeightEstimator) {
+func (h *Htlc) MaxSuccessWitnessSize() int {
 	// Calculate maximum success witness size
 	//
 	// - number_of_witness_elements: 1 byte
@@ -228,19 +234,21 @@ func (h *Htlc) AddSuccessToEstimator(estimator *input.TxWeightEstimator) {
 	// - preimage: 33 bytes
 	// - witness_script_length: 1 byte
 	// - witness_script: len(script) bytes
-	maxSuccessWitnessSize := 1 + 1 + 73 + 1 + 33 + 1 + len(h.Script)
+	return 1 + 1 + 73 + 1 + 33 + 1 + len(h.Script)
+}
 
+// AddSuccessToEstimator adds a successful spend to a weight estimator.
+func (h *Htlc) AddSuccessToEstimator(estimator *input.TxWeightEstimator) {
 	switch h.OutputType {
 	case HtlcP2WSH:
-		estimator.AddWitnessInput(maxSuccessWitnessSize)
+		estimator.AddWitnessInput(h.MaxSuccessWitnessSize())
 
 	case HtlcNP2WSH:
-		estimator.AddNestedP2WSHInput(maxSuccessWitnessSize)
+		estimator.AddNestedP2WSHInput(h.MaxSuccessWitnessSize())
 	}
 }
 
-// AddTimeoutToEstimator adds a timeout spend to a weight estimator.
-func (h *Htlc) AddTimeoutToEstimator(estimator *input.TxWeightEstimator) {
+func (h *Htlc) MaxTimeoutWitnessSize() int {
 	// Calculate maximum timeout witness size
 	//
 	// - number_of_witness_elements: 1 byte
@@ -250,13 +258,140 @@ func (h *Htlc) AddTimeoutToEstimator(estimator *input.TxWeightEstimator) {
 	// - zero: 1 byte
 	// - witness_script_length: 1 byte
 	// - witness_script: len(script) bytes
-	maxTimeoutWitnessSize := 1 + 1 + 73 + 1 + 1 + 1 + len(h.Script)
+	return 1 + 1 + 73 + 1 + 1 + 1 + len(h.Script)
+}
 
+// AddTimeoutToEstimator adds a timeout spend to a weight estimator.
+func (h *Htlc) AddTimeoutToEstimator(estimator *input.TxWeightEstimator) {
 	switch h.OutputType {
 	case HtlcP2WSH:
-		estimator.AddWitnessInput(maxTimeoutWitnessSize)
+		estimator.AddWitnessInput(h.MaxTimeoutWitnessSize())
 
 	case HtlcNP2WSH:
-		estimator.AddNestedP2WSHInput(maxTimeoutWitnessSize)
+		estimator.AddNestedP2WSHInput(h.MaxTimeoutWitnessSize())
 	}
+}
+
+type SweepWitness struct {
+	htlc          *Htlc
+	sweepType     HtlcSweepType
+	preimage      lntypes.Preimage
+	currentHeight uint32
+}
+
+var _ input.WitnessType = (*SweepWitness)(nil)
+
+func NewSuccessSweepWitness(htlc *Htlc, currentHeight uint32,
+	preimage lntypes.Preimage) *SweepWitness {
+
+	return &SweepWitness{
+		htlc:          htlc,
+		currentHeight: currentHeight,
+		sweepType:     HtlcSuccess,
+		preimage:      preimage,
+	}
+}
+
+func NewTimeoutSweepWitness(htlc *Htlc, currentHeight uint32) *SweepWitness {
+	return &SweepWitness{
+		htlc:          htlc,
+		currentHeight: currentHeight,
+		sweepType:     HtlcTimeout,
+	}
+}
+
+func (sw *SweepWitness) String() string {
+	switch sw.sweepType {
+	case HtlcSuccess:
+		return "LoopHtlcSuccess"
+	case HtlcTimeout:
+		return "LoopHtlcTimeout"
+	default:
+		return fmt.Sprintf(
+			"Unknown WitnessType: %v", uint8(sw.sweepType),
+		)
+	}
+}
+
+func (sw *SweepWitness) WitnessGenerator(signer input.Signer,
+	descriptor *input.SignDescriptor) input.WitnessGenerator {
+
+	return func(tx *wire.MsgTx, hc *txscript.TxSigHashes,
+		inputIndex int) (*input.Script, error) {
+
+		desc := descriptor
+		desc.SigHashes = hc
+		desc.InputIndex = inputIndex
+
+		tx.LockTime = sw.currentHeight
+
+		if sw.htlc.OutputType == HtlcNP2WSH {
+			tx.TxIn[inputIndex].SignatureScript = sw.htlc.SigScript
+		}
+
+		rawSig, err := signer.SignOutputRaw(
+			tx, descriptor,
+		)
+		if err != nil {
+			return nil, fmt.Errorf("could not sign: %v", err)
+		}
+
+		switch sw.sweepType {
+		case HtlcSuccess:
+			// Add witness stack to the tx input.
+			witness, err := sw.htlc.GenSuccessWitness(
+				rawSig, sw.preimage,
+			)
+			if err != nil {
+				return nil, err
+			}
+
+			return &input.Script{
+				Witness: witness,
+			}, nil
+		case HtlcTimeout:
+			// Add witness stack to the tx input.
+			witness, err := sw.htlc.GenTimeoutWitness(rawSig)
+			if err != nil {
+				return nil, err
+			}
+
+			return &input.Script{
+				Witness: witness,
+			}, nil
+		default:
+			return nil, fmt.Errorf(
+				"unknown sweep type: %v", sw.sweepType,
+			)
+		}
+	}
+}
+
+func (sw *SweepWitness) SizeUpperBound() (int, bool, error) {
+	isNestedP2SH := sw.htlc.OutputType == HtlcNP2WSH
+
+	switch sw.sweepType {
+	case HtlcSuccess:
+		return sw.htlc.MaxSuccessWitnessSize(), isNestedP2SH, nil
+	case HtlcTimeout:
+		return sw.htlc.MaxTimeoutWitnessSize(), isNestedP2SH, nil
+	default:
+		return 0, false, fmt.Errorf(
+			"unknown sweep type: %v", sw.sweepType,
+		)
+	}
+}
+func (sw *SweepWitness) AddWeightEstimation(
+	estimator *input.TxWeightEstimator) error {
+
+	switch sw.sweepType {
+	case HtlcSuccess:
+		sw.htlc.AddSuccessToEstimator(estimator)
+	case HtlcTimeout:
+		sw.htlc.AddSuccessToEstimator(estimator)
+	default:
+		return fmt.Errorf("unknown sweep type: %v", sw.sweepType)
+	}
+
+	return nil
 }
